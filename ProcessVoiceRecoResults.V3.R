@@ -13,6 +13,7 @@ library(stringr)
 library(stringi)
 library(tm)
 library(sentimentr)
+library(parallel)
 
 ###############################################################################
 
@@ -48,7 +49,6 @@ clean_data= data.frame(Kundennummer=character(),
                        CASE_ID=character(),
                        CONTENT=character(),
                        stringsAsFactors=FALSE)
-
 #loop through rows of file with comments (Base is not 0 not 1)
 #Read content row-wise and ...
 for(i in 1:nrow(myfiles)) {
@@ -143,6 +143,7 @@ comments_categories <- data.frame(
 # Stem document
 clean_data$CONTENT_CLEAN = stemDocument(clean_data$CONTENT_CLEAN)
 
+## Nested loop
 #Split Text and find categories
 for (i in 1:nrow(clean_data)){
   #print(paste(i, clean_data$CONTENT_CLEAN[i]))
@@ -199,6 +200,58 @@ for (i in 1:nrow(clean_data)){
   }
 }
 
+## lapply
+comments_categories <- mclapply(1:nrow(clean_data), function(i) {
+  # Initialize the result dataframe for each row
+  v_KDNR <- clean_data$Kundennummer[i]  # Get Kundennummer
+  df_com_split <- data.frame(v_KDNR)    # Convert to dataframe
+  colnames(df_com_split)[1] <- "Kundennummer"  # Set column name
+  
+  # Append necessary columns
+  df_com_split$CASE_ID <- clean_data$CASE_ID[i]
+  df_com_split$Datum <- clean_data$Datum[i]
+  df_com_split$CONTENT_CLEAN <- clean_data$CONTENT_CLEAN[i]
+  df_com_split$display <- 0
+  df_com_split$storagesize <- 0
+  df_com_split$service <- 0
+  df_com_split$coverage <- 0
+  df_com_split$price <- 0
+  
+  # Create corpus
+  corpus <- Corpus(VectorSource(clean_data$CONTENT_CLEAN[i]))   # Build Corpus
+  td.mat <- as.matrix(TermDocumentMatrix(corpus))               # Convert Corpus to TDM
+  df_td_mat <- data.frame(td.mat)                               # Convert to dataframe
+  
+  # If the term-document matrix is not empty, proceed
+  if (nrow(df_td_mat) > 0) {
+    # Loop over rows of the term-document matrix (using lapply for rows)
+    df_td_mat_rows <- mclapply(1:nrow(df_td_mat), function(x) {
+      # Loop over rows of category_DB (using lapply for rows)
+      category_match <- mclapply(1:nrow(category_DB), function(y) {
+        if (rownames(df_td_mat)[x] == category_DB$WORD[y]) {
+          gg <- unname(category_DB$CATEGORY[y])  # Get the category
+          # Check for category and increment the corresponding column in df_com_split
+          if (gg == "display") {
+            df_com_split$display <- df_com_split$display + 1
+          } else if (gg == "storagesize") {
+            df_com_split$storagesize <- df_com_split$storagesize + 1
+          } else if (gg == "service") {
+            df_com_split$service <- df_com_split$service + 1
+          } else if (gg == "coverage") {
+            df_com_split$coverage <- df_com_split$coverage + 1
+          } else if (gg == "price") {
+            df_com_split$price <- df_com_split$price + 1
+          }
+        }
+      })
+    })
+  }
+  
+  return(df_com_split)  # Return the result for this row
+})
+
+# Convert to dataframe
+comments_categories <- data.frame(t(sapply(comments_categories,c)))
 ###############################################################################
 
 #SENTIMENT
@@ -215,6 +268,37 @@ comments_categories_sentiment$Sentiment<-0                         #add and inti
 #  comments_categories_sentiment$Sentiment[i]=v_sentiment[1,4]            #write sentiment value to result file
 #}
 
+start_mc <- Sys.time()
+# Create a cluster of workers
+num_cores <- detectCores() - 1  # Detect the number of available cores and leave one core free
+cl <- makeCluster(num_cores)    # Create a cluster with the specified number of cores
+
+# Export necessary functions and data to the cluster
+clusterExport(cl, list("sentiment", "comments_categories_sentiment")) 
+
+# Use parLapply to apply the sentiment function in parallel across rows of the data frame
+comments_categories_sentiment$Sentiment <- parLapply(cl, 1:nrow(comments_categories_sentiment), function(i) {
+  
+  # Extract the clean content text from the row
+  clean_content <- as.character(comments_categories_sentiment$CONTENT_CLEAN[i])  # Ensure it's a character vector
+  
+  # Calculate sentiment for the clean content using sentimentr::sentiment()
+  v_sentiment <- sentiment(clean_content)  # Calculate sentiment
+  
+  # Return the sentiment value (typically the first row of the output data frame)
+  return(v_sentiment$sentiment[1])  # Assuming the result is a data frame with a 'sentiment' column
+  
+})
+
+# Stop the cluster to free up resources
+stopCluster(cl)
+end_mc <- Sys.time()
+duration_mc <- end_mc - start_mc
+print(duration_mc)
+
+# It took 9.75 seconds using 11 cores
+
+start_sc <- Sys.time()
 comments_categories_sentiment$Sentiment <- apply(comments_categories_sentiment, 1, function(row) {
   # Extract the clean content text from the row
   clean_content <- as.character(row["CONTENT_CLEAN"])  # Ensure it's a character vector
@@ -225,6 +309,11 @@ comments_categories_sentiment$Sentiment <- apply(comments_categories_sentiment, 
   # Return the sentiment value (typically the first row of the output data frame)
   return(v_sentiment$sentiment[1])  # Assuming the result is a data frame with a 'sentiment' column
 })
+end_sc <- Sys.time()
+duration_sc <- end_sc - start_sc
+print(duration_sc)
+
+# It took 52 seconds using single core
 
 #Prepare Write file: make sentiment score a string and suppress the text. 
 comments_categories_sentiment$Sentiment<-as.numeric(comments_categories_sentiment$Sentiment)
